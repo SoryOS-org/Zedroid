@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    ffi::c_void,
+    ffi::{OsString, c_void},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -14,9 +14,9 @@ use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
     DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions, Pixels,
-    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, PriorityQueueReceiver, RunnableVariant, Task, ThermalState, WindowAppearance,
-    WindowParams,
+    ActivityGuard, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, PriorityQueueReceiver, RunnableVariant, Task, ThermalState,
+    WindowAppearance, WindowParams,
 };
 use gpui_wgpu::GpuContext;
 
@@ -165,7 +165,7 @@ fn install_choreographer_callback() {
 #[derive(Default)]
 pub(crate) struct PlatformHandlers {
     pub(crate) open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
-    pub(crate) quit: Option<Box<dyn FnMut()>>,
+    pub(crate) quit: Option<Box<dyn FnMut() -> bool>>,
     pub(crate) reopen: Option<Box<dyn FnMut()>>,
     pub(crate) app_menu_action: Option<Box<dyn FnMut(&dyn Action)>>,
     pub(crate) will_open_app_menu: Option<Box<dyn FnMut()>>,
@@ -241,6 +241,8 @@ pub(crate) struct AndroidCommon {
     /// has the setting off.
     pub(crate) last_soft_keyboard_setting: Option<bool>,
     pub(crate) running: bool,
+    /// Set by `quit()` so `run()` exits the process once the event loop ends.
+    pub(crate) exit_requested: bool,
 }
 
 impl AndroidCommon {
@@ -283,6 +285,7 @@ impl AndroidCommon {
             last_extras_row_enabled: None,
             last_soft_keyboard_setting: None,
             running: true,
+            exit_requested: false,
         }
     }
 }
@@ -1219,32 +1222,41 @@ impl Platform for AndroidPlatform {
         log::info!("AndroidPlatform::run: exiting event loop");
         let quit = self.common.borrow_mut().callbacks.quit.take();
         if let Some(mut fun) = quit {
-            fun();
+            if !fun() {
+                log::warn!("AndroidPlatform::run: app was busy, shutdown skipped");
+            }
+        }
+        if self.common.borrow().exit_requested {
+            // gpui's quit hook only stops the run loop. On Android the
+            // hosting GameActivity stays alive (its JVM-side thread keeps
+            // running independently of `android_main` returning), so the
+            // user-visible result of a "Quit" menu click would be: editor
+            // stops responding to gestures but the window doesn't dismiss.
+            // Exit the process so `MainActivity.onDestroy` runs (it does
+            // its own `Process.killProcess` fallback + cursor / splash
+            // teardown) and the OS returns the user to the launcher.
+            std::process::exit(0);
         }
     }
 
     fn quit(&self) {
-        self.common.borrow_mut().running = false;
-        let quit = self.common.borrow_mut().callbacks.quit.take();
-        if let Some(mut fun) = quit {
-            fun();
-        }
-        // gpui's quit hook only stops the run loop. On Android the
-        // hosting GameActivity stays alive (its JVM-side thread keeps
-        // running independently of `android_main` returning), so the
-        // user-visible result of a "Quit" menu click would be: editor
-        // stops responding to gestures but the window doesn't dismiss.
-        // Exit the process so `MainActivity.onDestroy` runs (it does
-        // its own `Process.killProcess` fallback + cursor / splash
-        // teardown) and the OS returns the user to the launcher.
-        std::process::exit(0);
+        // App::quit runs inside an app update, where the quit callback can't
+        // borrow the app and skips App::shutdown, so quit observers (workspace
+        // serialization and the like) would never run. Stop the loop instead;
+        // run() invokes the callback once the update has unwound, as the
+        // Linux and Windows backends do.
+        let mut common = self.common.borrow_mut();
+        common.running = false;
+        common.exit_requested = true;
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {}
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<OsString>) {}
     fn activate(&self, _ignoring_other_apps: bool) {}
     fn hide(&self) {}
     fn hide_other_apps(&self) {}
     fn unhide_other_apps(&self) {}
+
+    fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         vec![Rc::new(AndroidDisplay::new())]
@@ -1367,11 +1379,14 @@ impl Platform for AndroidPlatform {
     fn reveal_path(&self, _path: &Path) {}
     fn open_with_system(&self, _path: &Path) {}
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.common.borrow_mut().callbacks.quit = Some(callback);
     }
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.common.borrow_mut().callbacks.reopen = Some(callback);
+    }
+    fn on_system_sleep(&self, _callback: Box<dyn FnMut()>) {
+        // Same as on_system_wake: no app-visible system sleep signal.
     }
     fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {
         // Android exposes no system sleep/wake signal to apps; process
@@ -1394,6 +1409,11 @@ impl Platform for AndroidPlatform {
         ThermalState::Nominal
     }
     fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "idle sleep prevention for {reason:?} is not yet implemented on Android"
+        )))
+    }
 
     fn compositor_name(&self) -> &'static str {
         "Android"
@@ -1425,23 +1445,26 @@ impl Platform for AndroidPlatform {
         crate::clipboard::write(&self.android_app, item);
     }
 
-    fn write_credentials(
-        &self,
-        _url: &str,
-        _username: &str,
-        _password: &[u8],
-    ) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!(
-            "credential storage not yet wired on Android"
-        )))
+    // Keystore operations are binder calls (and key generation can take
+    // hundreds of milliseconds), so keep them off the thread that renders.
+    fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
+        let android_app = self.android_app.clone();
+        let (url, username, password) = (url.to_owned(), username.to_owned(), password.to_vec());
+        self.background_executor().spawn(async move {
+            crate::credentials::write(&android_app, &url, &username, &password)
+        })
     }
-    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        Task::ready(Ok(None))
+    fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
+        let android_app = self.android_app.clone();
+        let url = url.to_owned();
+        self.background_executor()
+            .spawn(async move { crate::credentials::read(&android_app, &url) })
     }
-    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Err(anyhow::anyhow!(
-            "credential storage not yet wired on Android"
-        )))
+    fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
+        let android_app = self.android_app.clone();
+        let url = url.to_owned();
+        self.background_executor()
+            .spawn(async move { crate::credentials::delete(&android_app, &url) })
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {

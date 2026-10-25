@@ -1,5 +1,5 @@
 //! In-app updater for the Zdroid Android port. Hits the GitHub Releases
-//! page for `Dylanmurzello/zed-android-port`, compares the latest tag
+//! page for [`RELEASE_REPO`], compares the latest tag
 //! against the running app's `versionName`, and (when newer) downloads
 //! the signed APK to the app's cache dir and hands it to Android's
 //! package installer via the `MainActivity.launchPackageInstaller` JNI
@@ -37,7 +37,7 @@ pub fn register_android_app(app: AndroidApp) {
     let _ = ANDROID_APP.set(app);
 }
 
-fn android_app() -> Result<&'static AndroidApp> {
+pub(crate) fn android_app() -> Result<&'static AndroidApp> {
     ANDROID_APP
         .get()
         .ok_or_else(|| anyhow!("updater: AndroidApp not registered yet"))
@@ -45,8 +45,18 @@ fn android_app() -> Result<&'static AndroidApp> {
 
 /// Repo we ship APK releases from. Kept here (not in a config file)
 /// so a malicious user-config tweak can't redirect the auto-updater
-/// at a third-party APK.
-pub const RELEASE_REPO: &str = "Dylanmurzello/zed-android-port";
+/// at a third-party APK. Forks that publish APKs signed with their own
+/// key set `ZDROID_RELEASE_REPO` at build time: Android refuses to
+/// install an update signed by a different key, so the updater has to
+/// follow the repo that signed the running build.
+pub const RELEASE_REPO: &str = match option_env!("ZDROID_RELEASE_REPO") {
+    Some(repo) => repo,
+    None => "Dylanmurzello/zed-android-port",
+};
+
+/// Reject unexpectedly large responses before they fill the app cache.
+/// Current APKs are well below this.
+const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Asset name conventions the updater knows how to find. v0.2.0/v0.2.1
 /// shipped with `app-release.apk` (gradle's default release-output
@@ -332,6 +342,16 @@ pub fn download_apk(tag: &str, urls: &[String]) -> Result<PathBuf> {
                 continue;
             }
         };
+        if let Some(length) = resp
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            && length > MAX_APK_BYTES
+        {
+            last_err = Some(anyhow!(
+                "update APK is {length} bytes, above the {MAX_APK_BYTES}-byte safety limit"
+            ));
+            continue;
+        }
         let mut reader = resp.into_reader();
         let mut file = std::fs::File::create(&dest)
             .with_context(|| format!("create {}", dest.display()))?;
@@ -346,6 +366,11 @@ pub fn download_apk(tag: &str, urls: &[String]) -> Result<PathBuf> {
                 std::io::Write::write_all(&mut file, &buf[..n])
                     .with_context(|| format!("write {}", dest.display()))?;
                 total += n as u64;
+                if total > MAX_APK_BYTES {
+                    return Err(anyhow!(
+                        "update APK exceeded the {MAX_APK_BYTES}-byte safety limit"
+                    ));
+                }
             }
             Ok(())
         })();
@@ -357,6 +382,9 @@ pub fn download_apk(tag: &str, urls: &[String]) -> Result<PathBuf> {
             }
             Err(err) => {
                 log::warn!("updater: streaming {url} failed: {err:#}; trying next candidate");
+                if let Err(remove_err) = std::fs::remove_file(&dest) {
+                    log::warn!("updater: removing partial {} failed: {remove_err}", dest.display());
+                }
                 last_err = Some(err);
                 continue;
             }
